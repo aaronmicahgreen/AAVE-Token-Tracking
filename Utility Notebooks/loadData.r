@@ -14,6 +14,10 @@ gasFile <- "/avg_gas.csv"
 
 gas <- read_csv(paste(workingDirectory, dataPath, gasFile, sep=""))
 
+aavePriceFile <- "/hourly_prices.csv"
+
+aavePrices <- read_csv(paste(workingDirectory, dataPath, aavePriceFile, sep=""))
+
 ## Helper functions
 not_all_na <- function(x) any(!is.na(x))
 

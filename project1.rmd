@@ -35,5 +35,5 @@ uniqueUsersPlot
 library(crypto2)
 cryptoList <- crypto_list() %>%
   filter(symbol == "AAVE")
-aaveTokenPriceOverTime <- crypto_history(cryptoList, start_date = "20201130", interval = "hourly")
+aaveTokenPriceOverTime <- crypto_history(cryptoList, start_date = "20201130", end_date = "20220107", interval = "hourly")
 ```
