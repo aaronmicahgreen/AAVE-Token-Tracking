@@ -96,36 +96,186 @@ hourlySummaries <- left_join(hourlyTransactions, hourlyBorrowSummaries, by = "ho
   left_join(hourlyCollateralSummaries, by = "hour") %>%
   distinct() %>%
   arrange(hour) %>%
-  mutate(aaveNextHourPrice = lead(aavePriceUSD)) %>%
-  mutate(aaveHourlyChange = aaveNextHourPrice - aavePriceUSD) %>%
+  mutate(aaveNextHourPrice = lead(aavePriceUSD), aaveLastHourPrice = lag(aavePriceUSD)) %>%
+  mutate(aaveHourlyChangeForward = aaveNextHourPrice - aavePriceUSD, aaveChangeSinceLastHour = aavePriceUSD - aaveLastHourPrice) %>%
   select(-aaveNextHourPrice) %>%
-  mutate(aaveDirectionOfChange = sign(aaveHourlyChange))
+  mutate(aaveDirectionOfChange = sign(aaveHourlyChangeForward)) %>%
+  mutate(ethLastHourPrice = lag(ethPriceUSD)) %>%
+  mutate(ethChangeSinceLastHour = ethPriceUSD - ethLastHourPrice) %>%
+  mutate(ethDirectionOfChange = sign(ethChangeSinceLastHour)) %>%
+  filter(hour < "2022-01-06 22:00:00")
   
 
 
 hourlySummaries[is.na(hourlySummaries)] <- 0
+
+hourlyAverages <- hourlySummaries %>%
+  summarise(avgDeposits = mean(numDeposits), avgDepositsVal = mean(amountDepositedUSD),
+            avgBorrows = mean(numBorrows), avgBorrowVal = mean(amountBorrowedUSD),
+            avgRedeems = mean(numRedeems), avgRedeemVal = mean(amountRedeemedUSD),
+            avgRepays = mean(numRepays), avgRepayVal = mean(amountRepayedUSD))
 ```
 
 ```{r}
-linearModel <- lm(hourlySummaries$aaveDirectionOfChange ~., data = hourlySummaries)
+hourlySummariesWithDirection <- hourlySummaries %>%
+  select(-aaveHourlyChangeForward)
+linearModel <- lm(aaveDirectionOfChange ~., data = hourlySummariesWithDirection)
 summary(linearModel)
+
+
+hourlySummariesWithMagnitude <- hourlySummaries %>%
+  select(-aaveDirectionOfChange)
+
+linearModelMagnitude <- lm(aaveHourlyChangeForward ~., data = hourlySummariesWithMagnitude)
+summary(linearModelMagnitude)
 
 ```
 
 
 # Split the data into training and testing sets
 ```{r}
-trainData = hourlySummaries[1:5000,]
-testData = hourlySummaries[5000:length(hourlySummaries),]
+trainSamples <- floor(0.8 * length(hourlySummaries$hour))
+trainData = hourlySummaries[1:trainSamples,] %>%
+  select(-hour)
+testData = hourlySummaries[trainSamples:length(hourlySummaries$hour),] %>%
+  select(-hour)
+trainData <- data.frame(scale(trainData))
+testData <- data.frame(scale(testData))
+
 
 xTrain <- trainData %>%
-  select(-hour, -aaveHourlyChange)
+  select(-aaveHourlyChangeForward, -aaveDirectionOfChange)
 yTrain <- trainData %>%
-  select(aaveHourlyChange)
+  select(aaveHourlyChangeForward)
 
 xTest <- testData %>%
-  select(-hour, -aaveHourlyChange)
+  select(-aaveHourlyChangeForward, -aaveDirectionOfChange)
 yTest <- testData %>%
-  select(aaveHourlyChange)
+  select(aaveHourlyChangeForward)
 
+independentFeatures <- length(xTrain)
+
+```
+
+## Helper functions:
+```{r}
+# We want a function for calculating Mean-Squared Error:
+meanSquaredError <- function(predictedValue, actualValue){
+  return(mean((predictedValue - actualValue)^2))
+}
+
+# And also a function for calculating the R^2 error:
+R2 <- function(predictedValue, actualValue){
+  sumSquaresError <- sum((predictedValue - actualValue)^2)
+  sumSquaresTotal <- sum((actualValue - mean(actualValue))^2)
+  return(1-sumSquaresError/sumSquaresTotal)
+}
+```
+
+
+## Run Ridge Regression:
+```{r}
+library(glmnet)
+mseValsRidge <- c(NA)
+r2ValsRidge <- c(NA)
+adjustedR2ValsRidge <- c(NA)
+grid <- 10^seq(5, -10, length=100)
+
+ridgeRegression <- glmnet(xTrain, yTrain$aaveHourlyChangeForward, standardize = T,  alpha=0, lambda=grid, thresh=1e-8)
+
+for(i in 1:length(grid)){
+  prediction <- predict(ridgeRegression,s=grid[i],as.matrix(newx<-xTest))
+  mseValsRidge[i] <- meanSquaredError(prediction, yTest$aaveHourlyChangeForward)
+  r2ValsRidge[i] <- R2(prediction,yTest$aaveHourlyChangeForward)
+  adjustedR2ValsRidge[i] <- 1 - ((1-r2ValsRidge[i])*(trainSamples - 1) / (trainSamples - independentFeatures - 1))
+}
+
+par(mfrow=c(1,2))
+plot(mseValsRidge)
+plot(r2ValsRidge)
+lambda.ridge <- grid[which.min(mseValsRidge)]
+for(i in 1:length(grid)){
+  if(grid[i] == lambda.ridge) lambdaRidgeIndex = i
+}
+sprintf("Optimal value of lambda for the Ridge Regression is %.10f", lambda.ridge)
+print(ridgeRegression$beta[,lambdaRidgeIndex], digits=2)
+```
+## Plot the predictions of the ridge regression:
+```{r}
+firstTestHour <- hourlySummaries[trainSamples,1]$hour
+ridgePrediction <- predict(ridgeRegression, s = grid[lambdaRidgeIndex], as.matrix(newx <- xTest))
+
+ridgePredictions <- data.frame(ridgePrediction)
+aavePricesRidge <- aavePrices %>%
+  filter(hour >= firstTestHour & hour < "2022-01-06 22:00:00") %>%
+  bind_cols(ridgePredictions) %>%
+  mutate(ridgeGuessNextHour = priceUSD + s1) %>%
+  mutate(actualNextHour = lead(priceUSD))
+
+ridgePlot <- ggplot(data = aavePricesRidge, aes(x = hour)) + 
+  geom_line(aes(y = ridgeGuessNextHour), color = "red") 
+
+actualPlot <- ggplot(data = aavePricesRidge, aes(x = hour)) + 
+  geom_line(aes(y = actualNextHour), color = "blue") 
+ridgePlot
+actualPlot
+```
+
+## Run Lasso Regression:
+```{r}
+# The Lasso Regression can be computed the same way as the ridge regression, except we use alpha=1 in the call to glmnet.
+mseValsLasso <- c(NA)
+r2ValsLasso <- c(NA)
+adjustedR2ValsLasso <- c(NA)
+
+lassoRegression <- glmnet(xTrain, yTrain$aaveHourlyChangeForward, standardize = T,  alpha=1, lambda=grid, thresh=1e-8)
+
+for(i in 1:length(grid)){
+  prediction <- predict(lassoRegression,s=grid[i],as.matrix(newx<-xTest))
+  mseValsLasso[i] <- meanSquaredError(prediction, yTest$aaveHourlyChangeForward)
+  r2ValsLasso[i] <- R2(prediction,yTest$aaveHourlyChangeForward)
+  adjustedR2ValsLasso[i] <- 1 - ((1-r2ValsRidge[i])*(trainSamples - 1) / (trainSamples - 1 - 1))
+}
+
+par(mfrow=c(1,2))
+plot(mseValsLasso)
+plot(r2ValsLasso)
+lambda.lasso <- grid[which.min(mseValsLasso)]
+for(i in 1:length(grid)){
+  if(grid[i] == lambda.lasso) lambdaLassoIndex = i
+}
+sprintf("Optimal value of lambda for the Lasso Regression is %.10f", lambda.lasso)
+print(lassoRegression$beta[,lambdaLassoIndex], digits=2)
+```
+## Plot the predictions of the lasso regression:
+```{r}
+firstTestHour <- hourlySummaries[trainSamples,1]$hour
+lassoPrediction <- predict(lassoRegression, s = grid[lambdaLassoIndex], as.matrix(newx <- xTest))
+
+lassoPredictions <- data.frame(lassoPrediction)
+aavePricesLasso <- aavePrices %>%
+  filter(hour >= firstTestHour & hour < "2022-01-06 22:00:00") %>%
+  bind_cols(lassoPredictions) %>%
+  mutate(lassoGuessNextHour = priceUSD + s1) %>%
+  mutate(actualNextHour = lead(priceUSD))
+
+lassoPlot <- ggplot(data = aavePricesLasso, aes(x = hour)) + 
+  geom_line(aes(y = lassoGuessNextHour), color = "red") + 
+  geom_line(aes(y = actualNextHour), color = "blue") 
+library(plotly)
+ggplotly(lassoPlot)
+```
+
+## Granger-Causality Test
+```{r}
+library(lmtest)
+grangertest(numBorrows ~ aaveChangeSinceLastHour, order = 48, data = hourlySummaries)
+grangertest(aaveHourlyChange ~ numBorrows, order = 4, data = hourlySummaries)
+```
+
+
+## Auto-correlation tests
+```{r}
+armaModel <- arima(trainData$aavePriceUSD, method = c("ML"))
+autoplot(forecast(armaModel, level=c(95),h = 100))
 ```
