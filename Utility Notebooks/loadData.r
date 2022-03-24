@@ -18,6 +18,20 @@ aavePriceFile <- "/hourly_prices.csv"
 
 aavePrices <- read_csv(paste(workingDirectory, dataPath, aavePriceFile, sep=""))
 
+aavePrices <- aavePrices %>%
+  rename(hour = HOUR, priceUSD = PRICE) %>%
+  select(hour, priceUSD)
+
+ethPriceFile <- "/ethPrices.csv"
+
+ethPrices <- read_csv(paste(workingDirectory, dataPath, ethPriceFile, sep=""))
+
+ethPrices <- ethPrices %>%
+  rename(hour = HOUR, priceUSD = PRICE) %>%
+  select(hour, priceUSD)
+
+
+
 ## Helper functions
 not_all_na <- function(x) any(!is.na(x))
 
@@ -35,7 +49,8 @@ activeCollateral <- function(usr, ts, collaterals) {
 ## Add the gas fees to the transaction data
 df <- df %>%
   mutate(Date = floor_date(as_datetime(timestamp), unit = "hour")) %>%
-  left_join(gas, by = "Date")
+  left_join(gas, by = "Date") %>%
+  rename(gasFee = `Fee (USD)`)
 
 
 ## Create the basic dataframes for each transaction type:
