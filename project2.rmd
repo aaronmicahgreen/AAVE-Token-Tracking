@@ -1,0 +1,400 @@
+---
+title: "Project 1"
+author: "Rachel Long and Aaron Micah Green"
+date: "2/23/2022"
+output: html_document
+---
+## First, let's load the data using the loadData.r file:
+```{r, echo=FALSE, message=FALSE, warning=FALSE, tidy=TRUE, include=FALSE}
+rm(list = ls())
+source("Utility Notebooks/loadData.r")
+library(ggplot2)
+library(crypto2)
+```
+
+# Get the daily aave price data, which is what we will try and predict with our usage statistics
+```{r}
+aaveCoins <- reserveInfo %>%
+  select(symbol)
+coins <- crypto_list() %>%
+  filter(symbol %in% aaveCoins$symbol)
+coinPrices <- crypto_history(coin_list = coins, start_date = "20201203", end_date = "20220401", interval = "daily") 
+
+aavePrices <- coinPrices %>%
+  filter(symbol == "AAVE") %>%
+  select(timestamp, open, close) %>%
+  arrange(timestamp) %>%
+  mutate(day = floor_date(as_datetime(floor_date(timestamp, unit = "day")), unit = "day"), aavePrice = close) %>%
+  select(day, aavePrice) %>%
+  mutate(nextAavePrice = lead(aavePrice)) %>%
+  mutate(nextDayChangeAave = nextAavePrice / aavePrice - 1) %>%
+  mutate(lastAavePrice = lag(aavePrice)) %>%
+  mutate(aaveChangeSinceLastHour = aavePrice / lastAavePrice - 1) %>%
+  select(-nextAavePrice) %>%
+  mutate(aaveDirectionOfChange = sign(nextDayChangeAave)) %>%
+  drop_na()
+
+firstDay = min(aavePrices$day)
+lastDay = max(aavePrices$day)
+```
+
+## In order to make our prediction of the AAVE token price possible, we need to convert our data from raw transactions into hourly summary features:
+```{r}
+dailyCoinPrices <- coinPrices %>%
+  filter(symbol != "AAVE") %>%
+  select(symbol, open, close, timestamp) %>%
+  rename(reserve = symbol) %>%
+  filter(reserve %in% nonStableCoins$reserve) %>%
+  mutate(datetime = as_datetime(as_date(timestamp))) %>%
+  mutate(day = floor_date(datetime, unit = "day")) %>%
+  select(reserve, close, day) 
+
+relevantCoins <- dailyCoinPrices %>%
+  select(reserve) %>%
+  distinct()
+
+dailyCoinPriceInfo <- dailyCoinPrices %>%
+  select(day) %>%
+  distinct()
+
+for(coin in relevantCoins$reserve){
+  coinPriceCol <- str_c(coin, "Price", sep="")
+  prevPriceCol <- str_c(coin, "prevPrice", sep = "")
+  priceChange <- str_c(coin, "PriceChange", sep = "")
+  singleCoinPrices <- dailyCoinPrices %>%
+    filter(reserve == coin) %>%
+    select(day, close) %>%
+    rename({{coinPriceCol}} := close) %>%
+    group_by(day) %>%
+    slice_tail() %>%
+    ungroup() %>%
+    arrange(day)
+  
+  singleCoinPrices[[prevPriceCol]] = lag(singleCoinPrices[[coinPriceCol]])
+  singleCoinPrices[[priceChange]] = singleCoinPrices[[coinPriceCol]] / singleCoinPrices[[prevPriceCol]] - 1
+  
+  singleCoinPrices[[coinPriceCol]] <- NULL
+  singleCoinPrices[[prevPriceCol]] <- NULL
+  
+  dailyCoinPriceInfo <- dailyCoinPriceInfo %>%
+    left_join(singleCoinPrices, by = "day")
+  
+}
+
+days <- dailyCoinPrices %>%
+  select(day) %>%
+  distinct()
+
+dailyCoinUtilizationRates <- dailyCoinPrices %>%
+  select(day) %>%
+  distinct()
+
+utilizationRates <- reserveParamsHistory %>%
+  filter(symbol %in% relevantCoins$reserve) %>%
+  select(timestamp, symbol, utilizationRate) %>%
+  mutate(datetime = as_datetime(timestamp)) %>%
+  mutate(day = ceiling_date(datetime, unit = "day")) %>%
+  select(day, symbol, utilizationRate) %>%
+  rename(reserve = symbol)
+
+for(coin in aaveCoins$symbol) {
+  coinUtilRateCol <- str_c(coin, "UtilizationRate", sep = "")
+  prevUtilRateCol <- str_c(coin, "PrevUtilizationRate", sep = "")
+  utilRateChangeCol <- str_c(coin, "UtilizationRateChange", sep = "")
+  
+  singleCoinUtilization <- utilizationRates %>%
+    filter(reserve == coin) %>%
+    select(day, utilizationRate) %>%
+    rename({{coinUtilRateCol}} := utilizationRate) %>%
+    arrange(day) %>%
+    group_by(day) %>%
+    slice_tail()
+  
+  temp <- days %>%
+    left_join(singleCoinUtilization, by = "day")
+  
+  for(i in 1:length(temp$day)){
+    if(i == 1){
+      if(is.na(temp[[coinUtilRateCol]][i])){
+        temp[[coinUtilRateCol]][i] = 0
+      }
+    }else{
+      if(is.na(temp[[coinUtilRateCol]][i])){
+        temp[[coinUtilRateCol]][i] = temp[[coinUtilRateCol]][i-1]
+      }
+    }
+  }
+  
+  temp[[prevUtilRateCol]] = lag(temp[[coinUtilRateCol]])
+  temp[[utilRateChangeCol]] = case_when(temp[[prevUtilRateCol]] != 0 ~ temp[[coinUtilRateCol]] / temp[[prevUtilRateCol]] - 1,
+                                        TRUE ~ 0) 
+  
+  temp[[coinUtilRateCol]] <- NULL
+  temp[[prevUtilRateCol]] <- NULL
+  
+  dailyCoinUtilizationRates <- dailyCoinUtilizationRates %>%
+    left_join(temp, by = "day")
+}
+
+
+dailyDepositSummaries <- deposits %>%
+  mutate(day = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(day) %>%
+  transmute(numDeposits = n(),
+            amountDepositedUSD = sum(amountUSD),
+            uniqueUsersDeposits = n_distinct(user),
+            numReservesDeposited = n_distinct(reserve)) %>%
+  distinct()
+  
+dailyRedeemSummaries <- redeems %>%
+  mutate(day = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(day) %>%
+  transmute(numRedeems = n(),
+            amountRedeemedUSD = sum(amountUSD),
+            uniqueUsersRedeems = n_distinct(user),
+            numReservesRedeemed = n_distinct(reserve)) %>%
+  distinct()
+
+dailyBorrowSummaries <- borrows %>%
+  mutate(day = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(day) %>%
+  transmute(numBorrows = n(),
+            amountBorrowedUSD = sum(amountUSD),
+            uniqueUsersBorrows = n_distinct(user),
+            numReservesBorrowed = n_distinct(reserve)) %>%
+  distinct()
+
+dailyRepaySummaries <- repays %>%
+  mutate(day = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(day) %>%
+  transmute(numRepays = n(),
+            amountRepayedUSD = sum(amountUSD),
+            uniqueUsersRepays = n_distinct(user),
+            numReservesRepayed = n_distinct(reserve)) %>%
+  distinct()
+
+dailyLiquidationSummaries <- liquidations %>%
+  mutate(day = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(day) %>%
+  transmute(numLiquidations = n(),
+            amountCollateralLiquidatedUSD = sum(amountUSDCollateral),
+            amountPrincipalLiquidatedUSD = sum(amountUSDPrincipal),
+            uniqueLiquidators = n_distinct(liquidator),
+            uniqueLiquidatees = n_distinct(user),
+            numCollateralsLiquidated = n_distinct(collateralReserve),
+            numPrincipalsLiquidated = n_distinct(principalReserve)) %>%
+  distinct()
+
+dailySwapSummaries <- swaps %>%
+  mutate(day = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(day) %>%
+  transmute(numSwaps = n(),
+            uniqueUsersSwaps = n_distinct(user),
+            numReservesSwapped = n_distinct(reserve)) %>%
+  distinct()
+
+dailyCollateralSummaries <- collaterals %>%
+  mutate(day = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(day) %>%
+  transmute(numCollaterals = n(),
+            uniqueUsersCollaterals = n_distinct(user),
+            numReservesCollateral = n_distinct(reserve)) %>%
+  distinct()
+
+
+dailySummaries <- left_join(dailyCoinPriceInfo, dailyBorrowSummaries, by = "day") %>%
+  left_join(dailyDepositSummaries, by = "day") %>%
+  left_join(dailyRedeemSummaries, by = "day") %>%
+  left_join(dailyRepaySummaries, by = "day") %>%
+  left_join(dailyLiquidationSummaries, by = "day") %>%
+  left_join(dailySwapSummaries, by = "day") %>%
+  left_join(dailyCollateralSummaries, by = "day") %>%
+  left_join(aavePrices, by = "day") %>%
+  left_join(dailyCoinUtilizationRates, by = "day")%>%
+  distinct() %>%
+  arrange(day) %>%
+  filter(day >= firstDay, day <= lastDay) %>%
+  distinct()
+
+
+dailySummaries[is.na(dailySummaries)] <- 0
+
+```
+
+```{r}
+dailySummariesWithDirection <- dailySummaries %>%
+  select(-nextDayChangeAave)
+linearModel <- glm(aaveDirectionOfChange ~., data = dailySummariesWithDirection, )
+summary(linearModel)
+
+
+dailySummariesWithMagnitude <- dailySummaries %>%
+  select(-aaveDirectionOfChange)
+
+linearModelMagnitude <- lm(nextDayChangeAave ~., data = dailySummariesWithMagnitude)
+summary(linearModelMagnitude)
+
+```
+
+
+# Split the data into training and testing sets
+```{r}
+trainSamples <- floor(0.8 * length(dailySummaries$day))
+firstTestDay <- dailySummaries[trainSamples,]$day
+trainData = dailySummaries[1:trainSamples,] %>%
+  select(-day)
+testData = dailySummaries[trainSamples:length(dailySummaries$day),] %>%
+  select(-day)
+trainData <- data.frame(scale(trainData))
+testData <- data.frame(scale(testData))
+
+
+xTrain <- trainData %>%
+  select(-nextDayChangeAave, -aaveDirectionOfChange)
+yTrain <- trainData %>%
+  select(nextDayChangeAave)
+
+xTest <- testData %>%
+  select(-nextDayChangeAave, -aaveDirectionOfChange)
+yTest <- testData %>%
+  select(nextDayChangeAave)
+
+
+
+independentFeatures <- length(xTrain)
+
+```
+
+## Helper functions:
+```{r}
+# We want a function for calculating Mean-Squared Error:
+meanSquaredError <- function(predictedValue, actualValue){
+  return(mean((predictedValue - actualValue)^2))
+}
+
+# And also a function for calculating the R^2 error:
+R2 <- function(predictedValue, actualValue){
+  sumSquaresError <- sum((predictedValue - actualValue)^2)
+  sumSquaresTotal <- sum((actualValue - mean(actualValue))^2)
+  return(1-sumSquaresError/sumSquaresTotal)
+}
+```
+
+
+## Run Ridge Regression:
+```{r}
+library(glmnet)
+mseValsRidge <- c(NA)
+r2ValsRidge <- c(NA)
+adjustedR2ValsRidge <- c(NA)
+grid <- 10^seq(5, -10, length=100)
+
+ridgeRegression <- glmnet(xTrain, yTrain$nextDayChangeAave, standardize = T,  alpha=0, lambda=grid, thresh=1e-12)
+
+for(i in 1:length(grid)){
+  prediction <- predict(ridgeRegression,s=grid[i],as.matrix(newx<-xTest))
+  mseValsRidge[i] <- meanSquaredError(prediction, yTest$nextDayChangeAave)
+  r2ValsRidge[i] <- R2(prediction,yTest$nextDayChangeAave)
+  adjustedR2ValsRidge[i] <- 1 - ((1-r2ValsRidge[i])*(trainSamples - 1) / (trainSamples - independentFeatures - 1))
+}
+
+par(mfrow=c(1,2))
+plot(mseValsRidge)
+plot(r2ValsRidge)
+lambda.ridge <- grid[which.min(mseValsRidge)]
+for(i in 1:length(grid)){
+  if(grid[i] == lambda.ridge) lambdaRidgeIndex = i
+}
+sprintf("Optimal value of lambda for the Ridge Regression is %.10f", lambda.ridge)
+print(ridgeRegression$beta[,lambdaRidgeIndex], digits=2)
+```
+## Plot the predictions of the ridge regression:
+```{r}
+ridgePrediction <- predict(ridgeRegression, s = grid[lambdaRidgeIndex], as.matrix(newx <- xTest))
+
+ridgePredictions <- data.frame(ridgePrediction)
+aavePricesRidge <- aavePrices %>%
+  filter(day >= firstTestDay & day <= lastDay) %>%
+  bind_cols(ridgePredictions) %>%
+  mutate(ridgeGuessNextDay =  aavePrice + aavePrice*s1) %>%
+  mutate(actualNextDay = lead(aavePrice)) %>%
+  mutate(actualNextDayChange = actualNextDay / aavePrice - 1) %>%
+  mutate(difference = actualNextDayChange - s1)
+
+ridgePlot <- ggplot(data = aavePricesRidge, aes(x = as_date(day))) + 
+  geom_line(aes(y = s1), color = "red") + 
+  geom_line(aes(y = actualNextDayChange), color = "blue") 
+library(plotly)
+ggplotly(ridgePlot)
+
+ggplotly(ggplot(data = aavePricesRidge, aes(x = as_date(day), y = difference)) + geom_line())
+```
+
+## Run Lasso Regression:
+```{r}
+# The Lasso Regression can be computed the same way as the ridge regression, except we use alpha=1 in the call to glmnet.
+mseValsLasso <- c(NA)
+r2ValsLasso <- c(NA)
+adjustedR2ValsLasso <- c(NA)
+
+lassoRegression <- glmnet(xTrain, yTrain$nextDayChangeAave, standardize = T,  alpha=1, lambda=grid, thresh=1e-8)
+
+for(i in 1:length(grid)){
+  prediction <- predict(lassoRegression,s=grid[i],as.matrix(newx<-xTest))
+  mseValsLasso[i] <- meanSquaredError(prediction, yTest$nextDayChangeAave)
+  r2ValsLasso[i] <- R2(prediction,yTest$nextDayChangeAave)
+  adjustedR2ValsLasso[i] <- 1 - ((1-r2ValsRidge[i])*(trainSamples - 1) / (trainSamples - 1 - 1))
+}
+
+par(mfrow=c(1,2))
+plot(mseValsLasso)
+plot(r2ValsLasso)
+lambda.lasso <- grid[which.min(mseValsLasso)]
+for(i in 1:length(grid)){
+  if(grid[i] == lambda.lasso) lambdaLassoIndex = i
+}
+sprintf("Optimal value of lambda for the Lasso Regression is %.10f", lambda.lasso)
+print(lassoRegression$beta[,lambdaLassoIndex], digits=2)
+```
+## Plot the predictions of the lasso regression:
+```{r}
+lassoPrediction <- predict(lassoRegression, s = grid[lambdaLassoIndex], as.matrix(newx <- xTest))
+
+lassoPredictions <- data.frame(lassoPrediction)
+aavePricesLasso <- aavePrices %>%
+  filter(day >= firstTestDay & day <= lastDay) %>%
+  bind_cols(lassoPredictions) %>%
+  mutate(lassoGuessNextDay = aavePrice + aavePrice*s1) %>%
+  mutate(actualNextDay = lead(aavePrice))
+
+lassoPlot <- ggplot(data = aavePricesLasso, aes(x = as_date(day))) + 
+  geom_line(aes(y = lassoGuessNextDay), color = "red") + 
+  geom_line(aes(y = actualNextDay), color = "blue") 
+library(plotly)
+ggplotly(lassoPlot)
+```
+
+
+```{r}
+library(shapr)
+library(tensorflow)
+library(keras) # for deep learning
+library(tidyverse) # general utility functions
+library(caret) # machine learning utility functions
+
+
+# set some parameters for our model
+max_len <- 6 # the number of previous examples we'll look at
+batch_size <- 32 # number of sequences to look at at one time during training
+total_epochs <- 15 # how many times we'll look @ the whole dataset while training our model
+
+# set a random seed for reproducability
+set.seed(123)
+
+model <- keras_model_sequential() %>%
+  layer_simple_rnn(units = 6, activation = "tanh") %>%
+  layer_dense(units = 1)
+
+
+
+```
